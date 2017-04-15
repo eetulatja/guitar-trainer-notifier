@@ -10,40 +10,49 @@ import config from 'config';
 
 
 const mailgunClient = mailgun({
-	apiKey: config.get('apiKey'),
-	domain: config.get('domain'),
+	apiKey: config.get('mailgun.apiKey'),
+	domain: config.get('mailgun.domain'),
 });
 
 
 let previousLessons = [];
 
+const requests = [];
+
+
+function printWithTime(text) {
+	const timeText = moment().format('YYYY-MM-DD HH:mm:ss.SSS');
+	process.stdout.write(`${timeText} ${text}`);
+}
 
 async function login() {
 	await request({
-		url: config.get('url'),
+		url: config.get('superSaas.urls.frontpage'),
 		jar: true,
 	});
 
 	const text = await request({
-		url: config.get('loginUrl'),
+		url: config.get('superSaas.urls.login'),
 		method: 'POST',
 		form: {
-			name: config.get('login.name'),
-			password: config.get('login.password'),
+			name: config.get('superSaas.credentials.name'),
+			password: config.get('superSaas.credentials.password'),
 		},
 		jar: true,
 		followAllRedirects: true,
 	});
 }
 
-async function getLessons() {
-	process.stdout.write('Fetching lessons...');
+async function getLessons(verbose = true) {
+	if (verbose) {
+		printWithTime('Fetching lessons...');
+	}
 
 	const now = moment();
 	const after2Months = moment(now).add(2, 'month');
 
 	const response = await request({
-		url: config.get('lessonsUrl'),
+		url: config.get('superSaas.urls.reservations'),
 		qs: {
 			afrom: now.format('YYYY-MM-DD HH:mm'),
 			ato: after2Months.format('YYYY-MM-DD HH:mm'),
@@ -76,7 +85,9 @@ async function getLessons() {
 		return lesson;
 	});
 
-	process.stdout.write(`DONE Fetched ${lessons.length} lessons.\n`);
+	if (verbose) {
+		process.stdout.write(`DONE Fetched ${lessons.length} lessons.\n`);
+	}
 
 	return lessons;
 }
@@ -96,60 +107,70 @@ function printLessons(lessons) {
 	}
 }
 
-async function getNewLessons() {
-	const newLessons = await getLessons();
+async function getNewLessons(notifyFromOwnActions = false) {
+	printWithTime('Refreshing lessons...');
+
+	const newLessons = await getLessons(false);
 
 	const freedLessons = [];
 	for (const newLesson of newLessons) {
 		const oldLesson = _.find(previousLessons, ({ id }) => newLesson.id === id);
 
+		let shouldNotify = false;
+
 		if (!oldLesson) {
-			freedLessons.push(newLesson);
+			shouldNotify = true;
 		}
 		else {
 			const wasFreed = !oldLesson.hasSpace && newLesson.hasSpace;
-			const reserved = oldLesson.reservation || newLesson.reservation;
+			shouldNotify = wasFreed;
 
-			if (wasFreed && !reserved) {
-				freedLessons.push(newLesson);
+			if (!notifyFromOwnActions) {
+				const reserved = oldLesson.reservation || newLesson.reservation;
+				shouldNotify &= !reserved;
 			}
-			if (wasFreed) {
-				freedLessons.push(newLesson);
-			}
+		}
+
+		if (shouldNotify) {
+			freedLessons.push(newLesson);
 		}
 	}
 
 	previousLessons = newLessons;
 
+	process.stdout.write(`DONE Fetched ${newLessons.length} lessons, ${freedLessons.length} lessons freed.\n`);
+
 	if (freedLessons.length > 0) {
 		await sendMail(freedLessons);
 	}
-
-	console.log(moment().format('YYYY-MM-DD HH:mm:ss'));
-	console.log(freedLessons.length);
 }
 
 async function startHttpServer() {
-	process.stdout.write('Starting HTTP server...');
+	printWithTime('Starting HTTP server...');
 
 	const app = new Koa();
 	const router = new KoaRouter();
 
 	router.post('/refresh', async (ctx, next) => {
-		await getNewLessons();
+		const notifyFromOwnActions = (ctx.request.query.notify === 'always');
+
+		await getNewLessons(notifyFromOwnActions);
 
 		ctx.body = { message: 'Lessons reservation data refreshed.' };
 	});
 
 	app.use(router.routes());
 
-	await new Promise(resolve => app.listen(5000, resolve));
+
+	const port = config.get('server.port');
+
+	await new Promise(resolve => app.listen(port, resolve));
 
 	process.stdout.write('DONE\n');
 }
 
 async function sendMail(lessons) {
-	process.stdout.write('Sending email...');
+	printWithTime('Sending email...');
 
 	const body = 'Freed lessons:\n\n' + _.chain(lessons)
 		.groupBy(({ startDate }) => startDate.format('ddd D.M.'))
@@ -165,23 +186,28 @@ async function sendMail(lessons) {
 		.join('\n\n')
 		.value();
 
-	const data = {
-		from: config.get('mail.from'),
-		to: config.get('mail.to'),
-		subject: config.get('mail.subject'),
-		text: body,
-	};
+	const headers = config.get('mailgun.headers');
 
-	const response = await mailgunClient.messages().send(data);
+	const message = _.merge({ text: body }, headers);
+
+	const response = await mailgunClient.messages().send(message);
 
 	process.stdout.write('DONE\n');
+}
 
-	console.log(body)
+function pollLoop() {
+	const interval = Math.round((10 + 4 * Math.random() - 2) * 60 * 1000);
+
+	setTimeout(async () => {
+		await getNewLessons();
+
+		pollLoop();
+	}, interval);
 }
 
 
 async function main() {
-	process.stdout.write('Logging in...');
+	printWithTime('Logging in...');
 	await login();
 	process.stdout.write('DONE\n');
 
@@ -189,7 +215,7 @@ async function main() {
 
 	await startHttpServer();
 
-	setInterval(getNewLessons, 10 * 60 * 1000);
+	pollLoop();
 }
 
 Promise.resolve(main()).done();
